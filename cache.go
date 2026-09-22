@@ -6,9 +6,45 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 const cacheDirName = ".offpack"
+
+var cacheState = struct {
+	sync.Mutex
+	seen map[string]bool
+}{seen: make(map[string]bool)}
+
+var cacheDownloadSem = make(chan struct{}, 8)
+
+func resetCacheSeen() {
+	cacheState.Lock()
+	cacheState.seen = make(map[string]bool)
+	cacheState.Unlock()
+}
+
+func markCacheSeen(key string) bool {
+	cacheState.Lock()
+	defer cacheState.Unlock()
+	if cacheState.seen[key] {
+		return false
+	}
+	cacheState.seen[key] = true
+	return true
+}
+
+func cacheSeenCount() int {
+	cacheState.Lock()
+	defer cacheState.Unlock()
+	return len(cacheState.seen)
+}
+
+func withCacheNetwork(fn func() error) error {
+	cacheDownloadSem <- struct{}{}
+	defer func() { <-cacheDownloadSem }()
+	return fn()
+}
 
 func cacheDir() (string, error) {
 	home, err := os.UserHomeDir()
@@ -22,28 +58,28 @@ func cacheDir() (string, error) {
 	return dir, nil
 }
 
-func packageCacheDir(pkgName, version string) (string, error) {
+func packageCacheDir(name, version string) (string, error) {
 	cd, err := cacheDir()
 	if err != nil {
 		return "", err
 	}
-	dir := filepath.Join(cd, sanitizeName(pkgName), version)
+	dir := filepath.Join(cd, sanitizeName(name), version)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return "", fmt.Errorf("impossible de créer %s: %w", dir, err)
+		return "", err
 	}
 	return dir, nil
 }
 
-func cachedTarballPath(pkgName, version string) (string, error) {
-	dir, err := packageCacheDir(pkgName, version)
+func cachedTarballPath(name, version string) (string, error) {
+	dir, err := packageCacheDir(name, version)
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(dir, "package.tgz"), nil
 }
 
-func isCached(pkgName, version string) bool {
-	path, err := cachedTarballPath(pkgName, version)
+func isCached(name, version string) bool {
+	path, err := cachedTarballPath(name, version)
 	if err != nil {
 		return false
 	}
@@ -55,17 +91,17 @@ type CachedPackage struct {
 	Name         string            `json:"name"`
 	Version      string            `json:"version"`
 	Dependencies map[string]string `json:"dependencies"`
+	Integrity    string            `json:"integrity,omitempty"`
 }
 
-func saveCacheManifest(pkgName, version string, deps map[string]string) error {
-	dir, err := packageCacheDir(pkgName, version)
+func saveCacheManifest(name, version string, deps map[string]string, integrity ...string) error {
+	dir, err := packageCacheDir(name, version)
 	if err != nil {
 		return err
 	}
-	manifest := CachedPackage{
-		Name:         pkgName,
-		Version:      version,
-		Dependencies: deps,
+	manifest := CachedPackage{Name: name, Version: version, Dependencies: deps}
+	if len(integrity) > 0 {
+		manifest.Integrity = integrity[0]
 	}
 	data, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -74,8 +110,8 @@ func saveCacheManifest(pkgName, version string, deps map[string]string) error {
 	return os.WriteFile(filepath.Join(dir, "manifest.json"), data, 0644)
 }
 
-func loadCacheManifest(pkgName, version string) (*CachedPackage, error) {
-	dir, err := packageCacheDir(pkgName, version)
+func loadCacheManifest(name, version string) (*CachedPackage, error) {
+	dir, err := packageCacheDir(name, version)
 	if err != nil {
 		return nil, err
 	}
@@ -83,27 +119,24 @@ func loadCacheManifest(pkgName, version string) (*CachedPackage, error) {
 	if err != nil {
 		return nil, err
 	}
-	var m CachedPackage
-	if err := json.Unmarshal(data, &m); err != nil {
+	var manifest CachedPackage
+	if err := json.Unmarshal(data, &manifest); err != nil {
 		return nil, err
 	}
-	return &m, nil
+	return &manifest, nil
 }
 
 func resolveVersion(meta *PackageMeta, version string) string {
 	if version == "latest" || version == "" {
 		return meta.DistTags.Latest
 	}
-
 	if _, ok := meta.Versions[version]; ok {
 		return version
 	}
-
-	var versions []string
-	for v := range meta.Versions {
-		versions = append(versions, v)
+	versions := make([]string, 0, len(meta.Versions))
+	for candidate := range meta.Versions {
+		versions = append(versions, candidate)
 	}
-
 	return resolveBestVersion(versions, version)
 }
 
@@ -117,15 +150,92 @@ func unsanitizeName(name string) string {
 }
 
 func sanitizeName(name string) string {
-	var result []rune
+	var result strings.Builder
 	for _, r := range name {
-		if r == '/' || r == '\\' || r == ':' || r == '*' || r == '?' || r == '"' || r == '<' || r == '>' || r == '|' {
-			result = append(result, '_')
+		if strings.ContainsRune(`/\\:*?"<>|`, r) {
+			result.WriteRune('_')
 		} else {
-			result = append(result, r)
+			result.WriteRune(r)
 		}
 	}
-	return string(result)
+	return result.String()
+}
+
+func cacheKey(name, version string) string { return name + "@" + version }
+
+func cachePackage(name, version string) error {
+	meta, err := withMeta(name)
+	if err != nil {
+		return err
+	}
+	resolved := resolveVersion(meta, version)
+	if resolved == "" {
+		return fmt.Errorf("impossible de résoudre la version %s pour %s", version, name)
+	}
+	if !markCacheSeen(cacheKey(name, resolved)) || isCached(name, resolved) {
+		return nil
+	}
+
+	versionData, ok := meta.Versions[resolved]
+	if !ok {
+		return fmt.Errorf("version %s introuvable pour %s", resolved, name)
+	}
+	if versionData.Dist.Tarball == "" {
+		return fmt.Errorf("aucun tarball pour %s@%s", name, resolved)
+	}
+
+	var blob []byte
+	err = withCacheNetwork(func() error {
+		var downloadErr error
+		blob, downloadErr = downloadTarball(versionData.Dist.Tarball, versionData.Dist.Integrity)
+		return downloadErr
+	})
+	if err != nil {
+		return err
+	}
+
+	path, err := cachedTarballPath(name, resolved)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, blob, 0644); err != nil {
+		return err
+	}
+	if err := saveCacheManifest(name, resolved, versionData.Dependencies, versionData.Dist.Integrity); err != nil {
+		return err
+	}
+	fmt.Printf("  OK %s@%s\n", name, resolved)
+
+	var wg sync.WaitGroup
+	var firstErr error
+	var errMu sync.Mutex
+	for dep, constraint := range versionData.Dependencies {
+		dep, constraint := dep, constraint
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if depErr := cachePackage(dep, constraint); depErr != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = depErr
+				}
+				errMu.Unlock()
+				fmt.Fprintf(os.Stderr, "  ATTENTION: dépendance %s non téléchargée: %v\n", dep, depErr)
+			}
+		}()
+	}
+	wg.Wait()
+	return firstErr
+}
+
+func withMeta(name string) (*PackageMeta, error) {
+	var meta *PackageMeta
+	err := withCacheNetwork(func() error {
+		var fetchErr error
+		meta, fetchErr = fetchPackageMeta(name)
+		return fetchErr
+	})
+	return meta, err
 }
 
 func cmdCache() {
@@ -133,124 +243,53 @@ func cmdCache() {
 	if len(os.Args) > 2 {
 		pkgPath = os.Args[2]
 	}
-
 	pkg, err := readPackageJSON(pkgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Erreur: %v\n", err)
 		os.Exit(1)
 	}
-
-	allDeps := make(map[string]string)
-	for name, version := range pkg.Dependencies {
-		allDeps[name] = version
-	}
-	for name, version := range pkg.DevDependencies {
-		allDeps[name] = version
-	}
-
-	if len(allDeps) == 0 {
+	deps := mergeDeps(pkg)
+	if len(deps) == 0 {
 		fmt.Println("Aucune dépendance trouvée dans package.json")
 		return
 	}
+	resetCacheSeen()
+	fmt.Printf("Téléchargement de %d dépendances dans le cache...\n", len(deps))
+	cachePackages(deps)
+}
 
-	fmt.Printf("Téléchargement de %d dépendances dans le cache...\n", len(allDeps))
-	cachePackages(allDeps)
+func mergeDeps(pkg *PackageJSON) map[string]string {
+	deps := make(map[string]string)
+	for name, version := range pkg.Dependencies {
+		deps[name] = version
+	}
+	for name, version := range pkg.DevDependencies {
+		deps[name] = version
+	}
+	return deps
 }
 
 func cachePackages(deps map[string]string) {
-	type result struct {
-		name string
-		err  error
-	}
-	results := make(chan result, len(deps))
-	count := 0
-
-	for name, version := range deps {
-		count++
-		go func(name, version string) {
-			err := cachePackage(name, version)
-			results <- result{name, err}
-		}(name, version)
-	}
-
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
 	errors := 0
-	for i := 0; i < count; i++ {
-		r := <-results
-		if r.err != nil {
-			fmt.Fprintf(os.Stderr, "  ÉCHEC %s: %v\n", r.name, r.err)
-			errors++
-		}
+	for name, version := range deps {
+		name, version := name, version
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := cachePackage(name, version); err != nil {
+				fmt.Fprintf(os.Stderr, "  ÉCHEC %s: %v\n", name, err)
+				errMu.Lock()
+				errors++
+				errMu.Unlock()
+			}
+		}()
 	}
-
+	wg.Wait()
 	if errors > 0 {
 		fmt.Printf("\n%d erreur(s) rencontrée(s)\n", errors)
 	} else {
 		fmt.Println("\nToutes les dépendances sont en cache !")
 	}
-}
-
-var cacheSeen = make(map[string]bool)
-
-func cacheKey(name, version string) string {
-	return name + "@" + version
-}
-
-func cachePackage(name, version string) error {
-	meta, err := fetchPackageMeta(name)
-	if err != nil {
-		return err
-	}
-
-	resolvedVersion := resolveVersion(meta, version)
-	if resolvedVersion == "" {
-		return fmt.Errorf("impossible de résoudre la version %s pour %s", version, name)
-	}
-
-	key := cacheKey(name, resolvedVersion)
-	if cacheSeen[key] {
-		return nil
-	}
-	cacheSeen[key] = true
-
-	if isCached(name, resolvedVersion) {
-		return nil
-	}
-
-	versionData, ok := meta.Versions[resolvedVersion]
-	if !ok {
-		return fmt.Errorf("version %s introuvable pour %s", resolvedVersion, name)
-	}
-
-	tarballURL := versionData.Dist.Tarball
-	if tarballURL == "" {
-		return fmt.Errorf("aucun tarball pour %s@%s", name, resolvedVersion)
-	}
-
-	data, err := downloadTarball(tarballURL)
-	if err != nil {
-		return err
-	}
-
-	path, err := cachedTarballPath(name, resolvedVersion)
-	if err != nil {
-		return err
-	}
-
-	if err := os.WriteFile(path, data, 0644); err != nil {
-		return fmt.Errorf("impossible d'écrire %s: %w", path, err)
-	}
-
-	if err := saveCacheManifest(name, resolvedVersion, versionData.Dependencies); err != nil {
-		return fmt.Errorf("impossible de sauvegarder le manifest: %w", err)
-	}
-
-	fmt.Printf("  OK %s@%s\n", name, resolvedVersion)
-
-	for depName, depConstraint := range versionData.Dependencies {
-		if err := cachePackage(depName, depConstraint); err != nil {
-			fmt.Fprintf(os.Stderr, "  ATTENTION: dépendance %s non téléchargée: %v\n", depName, err)
-		}
-	}
-
-	return nil
 }
